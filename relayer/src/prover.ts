@@ -1,11 +1,5 @@
 /**
  * Prover module for generating ZK proofs for raffle claims
- * 
- * This module uses noir_js and bb.js to:
- * 1. Load the compiled circuit
- * 2. Generate witness from private inputs
- * 3. Generate ZK proof
- * 4. Format proof for on-chain verification
  */
 
 import { Noir } from '@noir-lang/noir_js';

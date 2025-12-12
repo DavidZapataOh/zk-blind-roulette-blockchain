@@ -1,17 +1,5 @@
 /**
  * Private Raffle Relayer Service
- * 
- * This service provides maximum privacy by:
- * 1. Generating ZK proofs on behalf of winners (if needed)
- * 2. Submitting claim transactions, paying gas so winner's address never interacts
- * 3. Not logging any identifying information
- * 
- * Privacy Flow:
- * 1. Winner generates proof locally or via this service
- * 2. Winner sends proof to relayer via HTTPS/Tor
- * 3. Relayer submits transaction on-chain
- * 4. Prize goes to winner's clean address
- * 5. No link between deposit and claim
  */
 
 import express, { Request, Response, NextFunction } from 'express';
