@@ -1,14 +1,14 @@
 use poseidon::poseidon2::Poseidon2;
 
-// Maximum Merkle tree depth (supports up to 2^10 = 1,024 participants)
-global MAX_DEPTH: u32 = 10;
+// Maximum Merkle tree depth (supports up to 2^32 = 4,294,967,296 participants)
+global MAX_DEPTH: u32 = 32;
 
 // Compute Poseidon2 hash of two Field elements
 fn hash2(a: Field, b: Field) -> Field {
     Poseidon2::hash([a, b], 2)
 }
 
-// Compute Poseidon2 hash of a single Field element  
+// Compute Poseidon2 hash of a single Field element
 fn hash1(a: Field) -> Field {
     Poseidon2::hash([a], 1)
 }

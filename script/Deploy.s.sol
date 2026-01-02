@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Script, console} from "forge-std/Script.sol";
 import {PrivateRaffle} from "../src/PrivateRaffle.sol";
 import {Poseidon2} from "poseidon2-evm/Poseidon2.sol";
+import {HonkVerifier} from "../src/UltraVerifier.sol";
 
 /**
  * @title DeployPrivateRaffle
@@ -20,16 +21,14 @@ import {Poseidon2} from "poseidon2-evm/Poseidon2.sol";
  *     --broadcast
  */
 contract DeployPrivateRaffle is Script {
-    // Already deployed on Scroll Sepolia via Remix
-    address constant VERIFIER_ADDRESS =
-        0x3Ab7eD4598E2841413Ab9EfAb1710835f0D952E9;
-
     function run() external {
         address poseidon2Address = vm.envOr("POSEIDON2_ADDRESS", address(0));
+        address verifierAddress = vm.envOr("VERIFIER_ADDRESS", address(0));
+        address supraRouterAddress = 0x7e0EA6e335EDA42f4c256246f62c6c3DCf4d4908;
 
         console.log("=== Deploying PrivateRaffle ===");
         console.log("Deployer:", msg.sender);
-        console.log("Verifier:", VERIFIER_ADDRESS);
+        console.log("Verifier:", verifierAddress);
         console.log("Poseidon2:", poseidon2Address);
 
         vm.startBroadcast();
@@ -40,10 +39,17 @@ contract DeployPrivateRaffle is Script {
             poseidon2Address = address(p2);
             console.log("Poseidon2 Deployed at:", poseidon2Address);
         }
+        if (verifierAddress == address(0)) {
+            console.log("Deploying Verifier...");
+            HonkVerifier verifier = new HonkVerifier();
+            verifierAddress = address(verifier);
+            console.log("Verifier Deployed at:", verifierAddress);
+        }
 
         PrivateRaffle raffle = new PrivateRaffle(
-            VERIFIER_ADDRESS,
-            poseidon2Address
+            verifierAddress,
+            poseidon2Address,
+            supraRouterAddress
         );
 
         console.log("\n=== Deployment Complete ===");

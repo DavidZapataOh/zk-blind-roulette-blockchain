@@ -1,23 +1,29 @@
+/*
+██████╗░░█████╗░███████╗███████╗███████╗██████╗░░█████╗░
+██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗██╔══██╗
+██████╔╝███████║█████╗░░█████╗░░█████╗░░██████╔╝██║░░██║
+██╔══██╗██╔══██║██╔══╝░░██╔══╝░░██╔══╝░░██╔══██╗██║░░██║
+██║░░██║██║░░██║██║░░░░░██║░░░░░███████╗██║░░██║╚█████╔╝
+╚═╝░░╚═╝╚═╝░░╚═╝╚═╝░░░░░╚═╝░░░░░╚══════╝╚═╝░░╚═╝░╚════╝░
+
+    https://raffero.com
+*/
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {INoirVerifier} from "./interfaces/INoirVerifier.sol";
-
-/**
- * @title IPoseidon2
- * @notice Interface for Poseidon2 hash contract (poseidon2-evm)
- */
-interface IPoseidon2 {
-    function hash_2(uint256 x, uint256 y) external view returns (uint256);
-}
+import {IncrementalMerkleTree, Poseidon2} from "./IncrementalMerkleTree.sol";
+import {IVerifier} from "./UltraVerifier.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ISupraRouter} from "./interfaces/ISupraRouter.sol";
 
 /**
  * @title PrivateRaffle
  * @notice Zero-Knowledge private raffle system where winners are completely anonymous
- * @dev Uses Noir ZK proofs for privacy and pseudo-randomness for winner selection
+ * @dev Uses Noir ZK proofs for privacy and dVRF for winner selection
  *      Uses Poseidon2 hash function for cryptographic compatibility with ZK circuit
  */
-contract PrivateRaffle {
+contract PrivateRaffle is IncrementalMerkleTree, ReentrancyGuard {
     // =========================================================================
     // TYPES
     // =========================================================================
@@ -42,15 +48,27 @@ contract PrivateRaffle {
         // Merkle tree state
         uint256 levels; // Tree height
         uint256 nextIndex; // Next leaf index
-        uint256 root; // Current Merkle root
+        bytes32 root; // Current Merkle root
         // Prize
         PrizeType prizeType;
         uint256 prizePool; // Total prize in wei
         // Status
         RaffleStatus status;
         uint256 winnerIndex; // Winning leaf index (set by VRF)
+        // dVRF
+        uint256 requestId;
+        bool randomnessRequested;
         // Timing
         uint256 createdAt;
+    }
+
+    struct ClaimInputs {
+        bytes32 root;
+        bytes32 nullifierHash;
+        bytes32 recipientBinding;
+        uint256 raffleId;
+        uint256 winnerIndex;
+        uint256 treeDepth;
     }
 
     // =========================================================================
@@ -58,20 +76,24 @@ contract PrivateRaffle {
     // =========================================================================
 
     address public owner;
-    INoirVerifier public verifier;
-    IPoseidon2 public immutable poseidon2;
+    IVerifier public verifier;
+    ISupraRouter public supraRouter;
 
     uint256 public raffleCounter;
+    uint256 public constant MAX_LEVELS = 32;
+    uint256 public constant MODULUS =
+        21888242871839275222246405745257275088548364400416034343698204186575808495617;
+    bytes32 public constant ZERO_VALUE =
+        bytes32(uint256(keccak256("raffero")) % MODULUS);
 
     // Raffle data
-    mapping(uint256 => Raffle) public raffles;
-    mapping(uint256 => uint256[]) public filledSubtrees; // raffleId => subtrees
-    mapping(uint256 => uint256[]) public emptySubtrees; // raffleId => empty subtrees
-    mapping(uint256 => mapping(uint256 => uint256)) public commitments; // raffleId => index => commitment
+    mapping(uint256 => Raffle) private raffles;
+    mapping(uint256 => mapping(uint256 => bytes32)) public commitments; // raffleId => index => commitment
 
     // Double-claim protection
-    mapping(uint256 => mapping(uint256 => bool)) public nullifierUsed; // raffleId => nullifierHash => used
-
+    mapping(uint256 => mapping(bytes32 => bool)) public commitmentUsed; // raffleId => commitment => used
+    mapping(uint256 => mapping(bytes32 => bool)) public nullifierUsed; // raffleId => nullifierHash => used
+    mapping(uint256 => uint256) public requestToRaffle; // requestId => raffleId
     // =========================================================================
     // EVENTS
     // =========================================================================
@@ -88,21 +110,15 @@ contract PrivateRaffle {
     event TicketPurchased(
         uint256 indexed raffleId,
         uint256 indexed leafIndex,
-        uint256 commitment
-        // NO address logged - privacy!
+        bytes32 commitment
     );
 
-    event WinnerSelected(
-        uint256 indexed raffleId,
-        uint256 winnerIndex
-        // NO winner address - only index
-    );
+    event WinnerSelected(uint256 indexed raffleId, uint256 winnerIndex);
 
     event PrizeClaimed(
         uint256 indexed raffleId,
         uint256 amount,
-        uint256 nullifierHash
-        // NO recipient logged - privacy via relayer
+        bytes32 nullifierHash
     );
 
     event RelayerPaid(
@@ -111,26 +127,37 @@ contract PrivateRaffle {
         uint256 fee
     );
 
+    event RandomnessRequested(uint256 indexed raffleId, uint256 requestId);
+
     // =========================================================================
     // ERRORS
     // =========================================================================
 
     error OnlyOwner();
-    error RaffleNotActive();
-    error RaffleNotClosed();
+    error RaffleNotActive(RaffleStatus status);
+    error RaffleNotClosed(RaffleStatus status);
     error RaffleAlreadyClaimed();
-    error InvalidTicketPrice();
-    error RaffleFull();
-    error RaffleEnded();
-    error RaffleNotEnded();
-    error NoParticipants();
+    error InvalidTicketPrice(uint256 amount, uint256 ticketPrice);
+    error RaffleFull(uint256 nextIndex, uint256 maxParticipants);
+    error RaffleEnded(uint256 timestamp, uint256 endTime);
+    error RaffleNotEnded(uint256 timestamp, uint256 endTime);
+    error NoParticipants(uint256 nextIndex);
     error InvalidProof();
     error NullifierAlreadyUsed();
     error TransferFailed();
-    error InvalidRecipientBinding();
-    error NotWinner();
-    error InvalidRootMismatch();
-    error InvalidRaffleId();
+    error InvalidRecipientBinding(
+        bytes32 recipientBinding,
+        bytes32 expectedBinding
+    );
+    error NotWinner(uint256 proofWinnerIndex, uint256 winnerIndex);
+    error InvalidRootMismatch(bytes32 proofRoot, bytes32 root);
+    error InvalidRaffleId(uint256 proofRaffleId, uint256 raffleId);
+    error InvalidLevels(uint256 levels);
+    error InvalidDuration(uint256 duration);
+    error InvalidPrize(uint256 prize);
+    error CommitmentAlreadyUsed();
+    error VRFAlreadyRequested();
+    error OnlySupraRouter();
 
     // =========================================================================
     // MODIFIERS
@@ -138,6 +165,11 @@ contract PrivateRaffle {
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
+        _;
+    }
+
+    modifier onlySupraRouter() {
+        if (msg.sender != address(supraRouter)) revert OnlySupraRouter();
         _;
     }
 
@@ -149,10 +181,14 @@ contract PrivateRaffle {
      * @param _verifier Address of the Noir proof verifier contract
      * @param _poseidon2 Address of the deployed Poseidon2 hash contract (poseidon2-evm)
      */
-    constructor(address _verifier, address _poseidon2) {
+    constructor(
+        address _verifier,
+        address _poseidon2,
+        address _supraRouter
+    ) IncrementalMerkleTree(Poseidon2(_poseidon2)) {
         owner = msg.sender;
-        verifier = INoirVerifier(_verifier);
-        poseidon2 = IPoseidon2(_poseidon2);
+        verifier = IVerifier(_verifier);
+        supraRouter = ISupraRouter(_supraRouter);
     }
 
     // =========================================================================
@@ -160,7 +196,7 @@ contract PrivateRaffle {
     // =========================================================================
 
     function setVerifier(address _verifier) external onlyOwner {
-        verifier = INoirVerifier(_verifier);
+        verifier = IVerifier(_verifier);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -181,10 +217,10 @@ contract PrivateRaffle {
         uint256 ticketPrice,
         uint256 levels,
         uint256 duration
-    ) external payable returns (uint256 raffleId) {
-        require(levels > 0 && levels <= 20, "Invalid levels");
-        require(duration > 0, "Invalid duration");
-        require(msg.value > 0, "Must deposit prize");
+    ) external payable nonReentrant returns (uint256 raffleId) {
+        if (levels > MAX_LEVELS || levels == 0) revert InvalidLevels(levels);
+        if (duration == 0) revert InvalidDuration(duration);
+        if (msg.value == 0) revert InvalidPrize(msg.value);
 
         raffleId = ++raffleCounter;
 
@@ -203,7 +239,9 @@ contract PrivateRaffle {
         r.createdAt = block.timestamp;
 
         // Initialize Merkle tree with empty subtrees
-        _initMerkleTree(raffleId, levels);
+        _initTree(raffleId, uint32(levels));
+        r.root = getLastRoot(raffleId);
+        r.nextIndex = getNextLeafIndex(raffleId);
 
         emit RaffleCreated(
             raffleId,
@@ -215,29 +253,8 @@ contract PrivateRaffle {
         );
     }
 
-    /**
-     * @notice Initialize empty Merkle tree subtrees using Poseidon2 hash
-     * @dev empty[0] = 0, empty[i] = Poseidon2(empty[i-1], empty[i-1])
-     */
-    function _initMerkleTree(uint256 raffleId, uint256 levels) internal {
-        uint256[] storage filled = filledSubtrees[raffleId];
-        uint256[] storage empty = emptySubtrees[raffleId];
-
-        // Initialize with zeros first
-        for (uint256 i = 0; i < levels; i++) {
-            filled.push(0);
-            empty.push(0);
-        }
-
-        // Compute empty subtrees: empty[i] = Poseidon2(empty[i-1], empty[i-1])
-        // empty[0] = 0 (empty leaf)
-        for (uint256 i = 1; i < levels; i++) {
-            empty[i] = _poseidon2Hash(empty[i - 1], empty[i - 1]);
-        }
-    }
-
     // =========================================================================
-    // TICKET PURCHASE (via Relayer for max privacy)
+    // TICKET PURCHASE
     // =========================================================================
 
     /**
@@ -248,106 +265,87 @@ contract PrivateRaffle {
      */
     function purchaseTicket(
         uint256 raffleId,
-        uint256 commitment
+        bytes32 commitment
     ) external payable {
         Raffle storage r = raffles[raffleId];
 
-        if (r.status != RaffleStatus.Active) revert RaffleNotActive();
-        if (block.timestamp >= r.endTime) revert RaffleEnded();
-        if (r.nextIndex >= r.maxParticipants) revert RaffleFull();
-        if (msg.value != r.ticketPrice) revert InvalidTicketPrice();
+        if (r.status != RaffleStatus.Active) revert RaffleNotActive(r.status);
+        if (block.timestamp >= r.endTime)
+            revert RaffleEnded(block.timestamp, r.endTime);
+        if (r.nextIndex >= r.maxParticipants)
+            revert RaffleFull(r.nextIndex, r.maxParticipants);
+        if (msg.value != r.ticketPrice)
+            revert InvalidTicketPrice(msg.value, r.ticketPrice);
+        if (commitmentUsed[raffleId][commitment])
+            revert CommitmentAlreadyUsed();
 
-        uint256 currentIndex = r.nextIndex;
+        uint32 insertedIndex = _insert(raffleId, commitment);
 
-        _insertLeaf(raffleId, commitment, currentIndex, r.levels);
+        commitments[raffleId][uint256(insertedIndex)] = commitment;
+        commitmentUsed[raffleId][commitment] = true;
 
-        commitments[raffleId][currentIndex] = commitment;
-
+        r.root = getLastRoot(raffleId);
+        r.nextIndex = uint256(getNextLeafIndex(raffleId));
         r.prizePool += msg.value;
-        r.nextIndex++;
 
-        emit TicketPurchased(raffleId, currentIndex, commitment);
-    }
-
-    /**
-     * @notice Insert leaf into Merkle tree and update root using Poseidon2
-     * @dev Standard incremental Merkle tree insertion
-     */
-    function _insertLeaf(
-        uint256 raffleId,
-        uint256 leaf,
-        uint256 index,
-        uint256 levels
-    ) internal {
-        uint256[] storage filled = filledSubtrees[raffleId];
-        uint256[] storage empty = emptySubtrees[raffleId];
-
-        uint256 currentHash = leaf;
-        uint256 currentIndex = index;
-
-        for (uint256 i = 0; i < levels; i++) {
-            uint256 left;
-            uint256 right;
-
-            if (currentIndex % 2 == 0) {
-                // Current is left child (even index)
-                left = currentHash;
-                right = empty[i];
-                filled[i] = currentHash;
-            } else {
-                // Current is right child (odd index)
-                left = filled[i];
-                right = currentHash;
-            }
-
-            // Poseidon2 hash of left and right
-            currentHash = _poseidon2Hash(left, right);
-            currentIndex >>= 1;
-        }
-
-        // Update root
-        raffles[raffleId].root = currentHash;
-    }
-
-    /**
-     * @notice Compute Poseidon2 hash of two field elements
-     * @dev Calls the external Poseidon2 contract (poseidon2-evm)
-     */
-    function _poseidon2Hash(
-        uint256 a,
-        uint256 b
-    ) internal view returns (uint256) {
-        return poseidon2.hash_2(a, b);
+        emit TicketPurchased(raffleId, uint256(insertedIndex), commitment);
     }
 
     // =========================================================================
-    // RAFFLE DRAWING (Gelato VRF)
+    // RAFFLE DRAWING
     // =========================================================================
 
     /**
-     * @notice Select winner using simple pseudo-randomness
-     * @dev Can only be called after raffle ends. Replaces VRF for now.
+     * @notice Select winner using dVRF
+     * @dev Can only be called after raffle ends.
      */
     function drawWinner(uint256 raffleId) external {
         Raffle storage r = raffles[raffleId];
 
-        if (r.status != RaffleStatus.Active) revert RaffleNotActive();
-        if (block.timestamp < r.endTime) revert RaffleNotEnded();
-        if (r.nextIndex == 0) revert NoParticipants();
+        if (r.status != RaffleStatus.Active) revert RaffleNotActive(r.status);
+        if (block.timestamp < r.endTime)
+            revert RaffleNotEnded(block.timestamp, r.endTime);
+        if (r.nextIndex == 0) revert NoParticipants(r.nextIndex);
+        if (r.randomnessRequested) revert VRFAlreadyRequested();
 
-        // Pseudo-randomness for testing/devnet
-        // Insecure for production!
-        uint256 randomness = uint256(
+        r.randomnessRequested = true;
+
+        uint256 seed = uint256(
             keccak256(
                 abi.encodePacked(
-                    block.timestamp,
-                    block.prevrandao,
+                    raffleId,
+                    r.root,
                     msg.sender,
-                    raffleId
+                    block.timestamp,
+                    block.prevrandao
                 )
             )
         );
+        uint256 requestId = supraRouter.generateRequest(
+            "supraCallback(uint256,uint256[])",
+            1,
+            1,
+            seed,
+            msg.sender
+        );
 
+        r.requestId = requestId;
+        requestToRaffle[requestId] = raffleId;
+
+        emit RandomnessRequested(raffleId, requestId);
+    }
+
+    function supraCallback(
+        uint256 requestId,
+        uint256[] calldata randomWords
+    ) external onlySupraRouter {
+        uint256 raffleId = requestToRaffle[requestId];
+        Raffle storage r = raffles[raffleId];
+
+        if (r.status != RaffleStatus.Active) return;
+        if (randomWords.length == 0) return;
+
+        uint256 randomness = randomWords[0];
         r.winnerIndex = randomness % r.nextIndex;
         r.status = RaffleStatus.Closed;
 
@@ -357,6 +355,88 @@ contract PrivateRaffle {
     // =========================================================================
     // PRIZE CLAIM (Via Relayer for max privacy)
     // =========================================================================
+    function _parsePublicInputs(
+        bytes32[] calldata publicInputs
+    ) internal pure returns (ClaimInputs memory ci) {
+        // Esperas exactamente 6 inputs
+        if (publicInputs.length != 6) revert InvalidProof();
+
+        ci.root = publicInputs[0];
+        ci.nullifierHash = publicInputs[1];
+        ci.recipientBinding = publicInputs[2];
+
+        // bytes32 -> uint256 (directo)
+        ci.raffleId = uint256(publicInputs[3]);
+        ci.winnerIndex = uint256(publicInputs[4]);
+        ci.treeDepth = uint256(publicInputs[5]);
+    }
+
+    function _validateClaim(
+        Raffle storage r,
+        uint256 raffleId,
+        ClaimInputs memory ci,
+        address recipient
+    ) internal view {
+        if (ci.raffleId != raffleId)
+            revert InvalidRaffleId(ci.raffleId, raffleId);
+
+        if (ci.root != r.root) revert InvalidRootMismatch(ci.root, r.root);
+
+        if (ci.winnerIndex != r.winnerIndex)
+            revert NotWinner(ci.winnerIndex, r.winnerIndex);
+
+        if (nullifierUsed[raffleId][ci.nullifierHash])
+            revert NullifierAlreadyUsed();
+        /*
+        bytes32 expected = _expectedRecipientBinding(
+            ci.nullifierHash,
+            recipient
+        );
+        if (ci.recipientBinding != expected)
+            revert InvalidRecipientBinding(ci.recipientBinding, expected);
+        */
+
+        // Si quieres, también puedes validar depth (opcional):
+        // if (ci.treeDepth != r.levels) revert InvalidProof(); // o crea error propio
+    }
+
+    /*
+    function _expectedRecipientBinding(
+        bytes32 nullifierHash,
+        address recipient
+    ) internal view returns (bytes32) {
+        return
+            Field.toBytes32(
+                poseidon2.hash_2(
+                    Field.toField(nullifierHash),
+                    Field.toField(uint160(recipient))
+                )
+            );
+    }
+    */
+
+    function _payout(
+        uint256 raffleId,
+        Raffle storage r,
+        address recipient,
+        uint256 relayerFee
+    ) internal returns (uint256 paidToRecipient) {
+        uint256 prizeAmount = r.prizePool;
+        r.prizePool = 0;
+
+        if (relayerFee > prizeAmount) revert TransferFailed();
+
+        paidToRecipient = prizeAmount - relayerFee;
+
+        if (relayerFee > 0) {
+            (bool okRelayer, ) = msg.sender.call{value: relayerFee}("");
+            if (!okRelayer) revert TransferFailed();
+            emit RelayerPaid(raffleId, msg.sender, relayerFee);
+        }
+
+        (bool okRecipient, ) = recipient.call{value: paidToRecipient}("");
+        if (!okRecipient) revert TransferFailed();
+    }
 
     /**
      * @notice Claim prize with ZK proof
@@ -386,56 +466,26 @@ contract PrivateRaffle {
         bytes32[] calldata publicInputs,
         address recipient,
         uint256 relayerFee
-    ) external {
+    ) external nonReentrant {
         Raffle storage r = raffles[raffleId];
 
-        if (r.status != RaffleStatus.Closed) revert RaffleNotClosed();
+        if (r.status != RaffleStatus.Closed) revert RaffleNotClosed(r.status);
 
         require(publicInputs.length == 6, "Invalid public inputs length");
 
-        uint256 proofRoot = uint256(publicInputs[0]);
-        uint256 nullifierHash = uint256(publicInputs[1]);
-        uint256 recipientBinding = uint256(publicInputs[2]);
-        uint256 proofRaffleId = uint256(publicInputs[3]);
-        uint256 proofWinnerIndex = uint256(publicInputs[4]);
+        ClaimInputs memory ci = _parsePublicInputs(publicInputs);
 
-        if (proofRaffleId != raffleId) revert InvalidRaffleId();
-
-        if (proofRoot != r.root) revert InvalidRootMismatch();
-
-        if (proofWinnerIndex != r.winnerIndex) revert NotWinner();
-
-        if (nullifierUsed[raffleId][nullifierHash])
-            revert NullifierAlreadyUsed();
-
-        uint256 expectedBinding = _poseidon2Hash(
-            nullifierHash,
-            uint256(uint160(recipient))
-        );
-        if (recipientBinding != expectedBinding)
-            revert InvalidRecipientBinding();
+        _validateClaim(r, raffleId, ci, recipient);
 
         if (!verifier.verify(proof, publicInputs)) revert InvalidProof();
 
-        nullifierUsed[raffleId][nullifierHash] = true;
+        nullifierUsed[raffleId][ci.nullifierHash] = true;
 
         r.status = RaffleStatus.Claimed;
 
-        uint256 prizeAmount = r.prizePool;
-        r.prizePool = 0;
+        uint256 paidToRecipient = _payout(raffleId, r, recipient, relayerFee);
 
-        uint256 recipientAmount = prizeAmount - relayerFee;
-
-        if (relayerFee > 0) {
-            (bool relayerSuccess, ) = msg.sender.call{value: relayerFee}("");
-            if (!relayerSuccess) revert TransferFailed();
-            emit RelayerPaid(raffleId, msg.sender, relayerFee);
-        }
-
-        (bool success, ) = recipient.call{value: recipientAmount}("");
-        if (!success) revert TransferFailed();
-
-        emit PrizeClaimed(raffleId, recipientAmount, nullifierHash);
+        emit PrizeClaimed(raffleId, paidToRecipient, ci.nullifierHash);
     }
 
     // =========================================================================
@@ -446,7 +496,7 @@ contract PrivateRaffle {
         return raffles[raffleId];
     }
 
-    function getRoot(uint256 raffleId) external view returns (uint256) {
+    function getRoot(uint256 raffleId) external view returns (bytes32) {
         return raffles[raffleId].root;
     }
 
@@ -467,14 +517,6 @@ contract PrivateRaffle {
             r.status == RaffleStatus.Active &&
             block.timestamp >= r.endTime &&
             r.nextIndex > 0;
-    }
-
-    /**
-     * @notice Compute Poseidon2 hash externally (for off-chain use)
-     * @dev Useful for generating commitments off-chain
-     */
-    function computeHash(uint256 a, uint256 b) external view returns (uint256) {
-        return _poseidon2Hash(a, b);
     }
 
     // =========================================================================

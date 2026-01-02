@@ -2,38 +2,49 @@
 pragma solidity ^0.8.20;
 
 import {Test, console} from "forge-std/Test.sol";
-import {PrivateRaffle} from "../src/PrivateRaffle.sol";
-import {INoirVerifier} from "../src/interfaces/INoirVerifier.sol";
+import {PrivateRaffle, Poseidon2} from "../src/PrivateRaffle.sol";
+import {HonkVerifier} from "../src/UltraVerifier.sol";
+import {ISupraRouter} from "../src/interfaces/ISupraRouter.sol";
 
-/**
- * @title MockVerifier
- * @notice Mock verifier that always returns true for testing
- */
-contract MockVerifier is INoirVerifier {
-    bool public shouldPass = true;
+contract MockSupraRouter is ISupraRouter {
+    uint256 public nextRequestId = 1;
 
-    function setShouldPass(bool _shouldPass) external {
-        shouldPass = _shouldPass;
+    function generateRequest(
+        string memory _functionSig,
+        uint8 _rngCount,
+        uint256 _numConfirmations,
+        uint256 _clientSeed,
+        address _clientWalletAddress
+    ) external returns (uint256 requestId) {
+        requestId = nextRequestId++;
     }
 
-    function verify(
-        bytes calldata,
-        bytes32[] calldata
-    ) external view returns (bool) {
-        return shouldPass;
-    }
-}
+    function fulfill(
+        address consumer,
+        uint256 requestId,
+        uint256 randomness
+    ) external {
+        uint256[] memory words = new uint256[](1);
+        words[0] = randomness;
 
-/**
- * @title MockPoseidon2
- * @notice Mock Poseidon2 hash contract for testing
- */
-contract MockPoseidon2 {
-    uint256 constant BN254_FIELD_PRIME =
-        21888242871839275222246405745257275088548364400416034343698204186575808495617;
+        // llama el callback del consumer (tu PrivateRaffle)
+        (bool ok, bytes memory ret) = consumer.call(
+            abi.encodeWithSignature(
+                "supraCallback(uint256,uint256[])",
+                requestId,
+                words
+            )
+        );
 
-    function hash_2(uint256 x, uint256 y) external pure returns (uint256) {
-        return uint256(keccak256(abi.encodePacked(x, y))) % BN254_FIELD_PRIME;
+        if (!ok) {
+            // bubble revert reason si existe
+            if (ret.length > 0) {
+                assembly {
+                    revert(add(ret, 32), mload(ret))
+                }
+            }
+            revert("MockSupraRouter: callback failed");
+        }
     }
 }
 
@@ -42,30 +53,79 @@ contract MockPoseidon2 {
  */
 contract PrivateRaffleTest is Test {
     PrivateRaffle public raffle;
-    MockVerifier public verifier;
-    MockPoseidon2 public poseidon2;
+    HonkVerifier public verifier;
+    Poseidon2 public poseidon2;
+    MockSupraRouter public supraRouter;
 
-    address public creator = address(0x1);
-    address public participant1 = address(0x2);
-    address public participant2 = address(0x3);
-    address public relayer = address(0x4);
-    address public winner = address(0x5);
-    address public gelatoVRF = address(0x6);
+    address public creator = makeAddr("creator");
+    address public participant1 = makeAddr("participant1");
+    address public participant2 = makeAddr("participant2");
+    address public relayer = makeAddr("relayer");
+    address public winner = makeAddr("winner");
 
     uint256 constant TICKET_PRICE = 0.01 ether;
     uint256 constant PRIZE_AMOUNT = 1 ether;
-    uint256 constant LEVELS = 10;
+    uint256 constant LEVELS = 20;
     uint256 constant DURATION = 1 days;
 
     function setUp() public {
-        verifier = new MockVerifier();
-        poseidon2 = new MockPoseidon2();
-        raffle = new PrivateRaffle(address(verifier), address(poseidon2));
+        verifier = new HonkVerifier();
+        poseidon2 = new Poseidon2();
+        supraRouter = new MockSupraRouter();
+        raffle = new PrivateRaffle(
+            address(verifier),
+            address(poseidon2),
+            address(supraRouter)
+        );
 
         vm.deal(creator, 10 ether);
         vm.deal(participant1, 10 ether);
         vm.deal(participant2, 10 ether);
         vm.deal(relayer, 1 ether);
+    }
+
+    function _getCommitment()
+        internal
+        returns (bytes32 _commitment, bytes32 _nullifier, bytes32 _secret)
+    {
+        string[] memory inputs = new string[](3);
+        inputs[0] = "npx";
+        inputs[1] = "tsx";
+        inputs[2] = "js-scripts/generateCommitment.ts";
+        bytes memory result = vm.ffi(inputs);
+        (_commitment, _nullifier, _secret) = abi.decode(
+            result,
+            (bytes32, bytes32, bytes32)
+        );
+        return (_commitment, _nullifier, _secret);
+    }
+
+    function _getProof(
+        bytes32 _nullifier,
+        bytes32 _secret,
+        address _recipient,
+        uint256 raffleId,
+        uint256 winnerIndex,
+        uint256 treeDepth,
+        bytes32[] memory leaves
+    ) internal returns (bytes memory _proof, bytes32[] memory _publicInputs) {
+        string[] memory inputs = new string[](leaves.length + 9);
+        inputs[0] = "npx";
+        inputs[1] = "tsx";
+        inputs[2] = "js-scripts/generateProof.ts";
+        inputs[3] = vm.toString(_nullifier);
+        inputs[4] = vm.toString(_secret);
+        inputs[5] = vm.toString(bytes32(uint256(uint160(_recipient))));
+        inputs[6] = vm.toString(raffleId);
+        inputs[7] = vm.toString(winnerIndex);
+        inputs[8] = vm.toString(treeDepth);
+
+        for (uint256 i = 0; i < leaves.length; i++) {
+            inputs[9 + i] = vm.toString(leaves[i]);
+        }
+        // use ffi to run scripts in the CLI to create a commitment
+        bytes memory result = vm.ffi(inputs);
+        (_proof, _publicInputs) = abi.decode(result, (bytes, bytes32[]));
     }
 
     // =========================================================================
@@ -89,13 +149,13 @@ contract PrivateRaffleTest is Test {
 
     function test_RevertWhen_CreateRaffle_NoPrize() public {
         vm.prank(creator);
-        vm.expectRevert("Must deposit prize");
+        vm.expectRevert();
         raffle.createRaffle{value: 0}(TICKET_PRICE, LEVELS, DURATION);
     }
 
     function test_RevertWhen_CreateRaffle_InvalidLevels() public {
         vm.prank(creator);
-        vm.expectRevert("Invalid levels");
+        vm.expectRevert();
         raffle.createRaffle{value: PRIZE_AMOUNT}(TICKET_PRICE, 0, DURATION);
     }
 
@@ -111,10 +171,14 @@ contract PrivateRaffleTest is Test {
             DURATION
         );
 
-        uint256 commitment = poseidon2.hash_2(uint256(12345), uint256(67890));
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
 
         vm.prank(participant1);
-        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, commitment);
+        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
 
         assertEq(raffle.getParticipantCount(raffleId), 1);
     }
@@ -127,11 +191,15 @@ contract PrivateRaffleTest is Test {
             DURATION
         );
 
-        uint256 commitment = poseidon2.hash_2(uint256(111), uint256(222));
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
 
         vm.prank(participant1);
-        vm.expectRevert(PrivateRaffle.InvalidTicketPrice.selector);
-        raffle.purchaseTicket{value: TICKET_PRICE - 1}(raffleId, commitment);
+        vm.expectRevert();
+        raffle.purchaseTicket{value: TICKET_PRICE - 1}(raffleId, _commitment);
     }
 
     function test_RevertWhen_PurchaseTicket_RaffleEnded() public {
@@ -144,11 +212,15 @@ contract PrivateRaffleTest is Test {
 
         vm.warp(block.timestamp + DURATION + 1);
 
-        uint256 commitment = poseidon2.hash_2(uint256(111), uint256(222));
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
 
         vm.prank(participant1);
-        vm.expectRevert(PrivateRaffle.RaffleEnded.selector);
-        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, commitment);
+        vm.expectRevert();
+        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
     }
 
     // =========================================================================
@@ -163,14 +235,28 @@ contract PrivateRaffleTest is Test {
             DURATION
         );
 
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
+
         vm.prank(participant1);
-        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, 123);
+        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
 
         vm.warp(block.timestamp + DURATION + 1);
         raffle.drawWinner(raffleId);
 
         PrivateRaffle.Raffle memory r = raffle.getRaffle(raffleId);
+        assertEq(uint256(r.status), uint256(PrivateRaffle.RaffleStatus.Active));
+        assertTrue(r.randomnessRequested);
+        assertGt(r.requestId, 0);
+
+        supraRouter.fulfill(address(raffle), r.requestId, 777);
+
+        r = raffle.getRaffle(raffleId);
         assertEq(uint256(r.status), uint256(PrivateRaffle.RaffleStatus.Closed));
+        assertEq(r.winnerIndex, 0);
     }
 
     function test_DrawWinner_MultipleParticipants() public {
@@ -184,17 +270,25 @@ contract PrivateRaffleTest is Test {
         for (uint256 i = 0; i < 5; i++) {
             address participant = address(uint160(100 + i));
             vm.deal(participant, 1 ether);
+            (
+                bytes32 _commitment,
+                bytes32 _nullifier,
+                bytes32 _secret
+            ) = _getCommitment();
             vm.prank(participant);
-            raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, i + 1);
+            raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
         }
 
         vm.warp(block.timestamp + DURATION + 1);
         raffle.drawWinner(raffleId);
-
         PrivateRaffle.Raffle memory r = raffle.getRaffle(raffleId);
+
+        uint256 random = 9; // 9 % 5 = 4
+        supraRouter.fulfill(address(raffle), r.requestId, random);
+
+        r = raffle.getRaffle(raffleId);
         assertEq(uint256(r.status), uint256(PrivateRaffle.RaffleStatus.Closed));
-        // We can't deterministic check winner index easily without mocking block params,
-        // but we assert it is within bounds
+        assertEq(r.winnerIndex, 4);
         assertLt(r.winnerIndex, 5);
     }
 
@@ -210,29 +304,38 @@ contract PrivateRaffleTest is Test {
             DURATION
         );
 
-        uint256 commitment = poseidon2.hash([uint256(12345), uint256(67890)]);
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
+
         vm.prank(participant1);
-        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, commitment);
+        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
 
         vm.warp(block.timestamp + DURATION + 1);
         raffle.drawWinner(raffleId);
 
         PrivateRaffle.Raffle memory r = raffle.getRaffle(raffleId);
 
-        bytes32[] memory publicInputs = new bytes32[](6);
-        publicInputs[0] = bytes32(r.root);
-        uint256 nullifierHash = poseidon2.hash_2(uint256(67890), uint256(0));
-        publicInputs[1] = bytes32(nullifierHash);
-        uint256 recipientBinding = poseidon2.hash_2(
-            nullifierHash,
-            uint256(uint160(winner))
-        );
-        publicInputs[2] = bytes32(recipientBinding);
-        publicInputs[3] = bytes32(uint256(raffleId));
-        publicInputs[4] = bytes32(r.winnerIndex);
-        publicInputs[5] = bytes32(uint256(LEVELS));
+        supraRouter.fulfill(address(raffle), r.requestId, 0);
 
-        bytes memory proof = "mock_proof";
+        r = raffle.getRaffle(raffleId);
+        assertEq(uint256(r.status), uint256(PrivateRaffle.RaffleStatus.Closed));
+        assertEq(r.winnerIndex, 0);
+
+        bytes32[] memory leaves = new bytes32[](1);
+        leaves[0] = _commitment;
+
+        (bytes memory proof, bytes32[] memory publicInputs) = _getProof(
+            _nullifier,
+            _secret,
+            participant1,
+            raffleId,
+            r.winnerIndex,
+            LEVELS,
+            leaves
+        );
         uint256 relayerFee = 0.001 ether;
         uint256 winnerBalanceBefore = winner.balance;
 
@@ -255,35 +358,41 @@ contract PrivateRaffleTest is Test {
             DURATION
         );
 
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
+
         vm.prank(participant1);
-        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, 123);
+        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
 
         vm.warp(block.timestamp + DURATION + 1);
         raffle.drawWinner(raffleId);
-
         PrivateRaffle.Raffle memory r = raffle.getRaffle(raffleId);
+        supraRouter.fulfill(address(raffle), r.requestId, 0);
 
-        bytes32[] memory publicInputs = new bytes32[](6);
-        publicInputs[0] = bytes32(r.root);
-        uint256 nullifierHash = 111222333;
-        publicInputs[1] = bytes32(nullifierHash);
-        uint256 recipientBinding = poseidon2.hash_2(
-            nullifierHash,
-            uint256(uint160(winner))
+        r = raffle.getRaffle(raffleId);
+
+        bytes32[] memory leaves = new bytes32[](1);
+        leaves[0] = _commitment;
+
+        (bytes memory proof, bytes32[] memory publicInputs) = _getProof(
+            _nullifier,
+            _secret,
+            participant1,
+            raffleId,
+            r.winnerIndex,
+            LEVELS,
+            leaves
         );
-        publicInputs[2] = bytes32(recipientBinding);
-        publicInputs[3] = bytes32(uint256(raffleId));
-        publicInputs[4] = bytes32(r.winnerIndex);
-        publicInputs[5] = bytes32(uint256(LEVELS));
-
-        bytes memory proof = "mock_proof";
 
         vm.prank(relayer);
         raffle.claimPrize(raffleId, proof, publicInputs, winner, 0);
 
         // Second claim should fail
         vm.prank(relayer);
-        vm.expectRevert(PrivateRaffle.RaffleNotClosed.selector);
+        vm.expectRevert();
         raffle.claimPrize(raffleId, proof, publicInputs, winner, 0);
     }
 
@@ -295,30 +404,37 @@ contract PrivateRaffleTest is Test {
             DURATION
         );
 
+        (
+            bytes32 _commitment,
+            bytes32 _nullifier,
+            bytes32 _secret
+        ) = _getCommitment();
+
         vm.prank(participant1);
-        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, 123);
+        raffle.purchaseTicket{value: TICKET_PRICE}(raffleId, _commitment);
 
         vm.warp(block.timestamp + DURATION + 1);
         raffle.drawWinner(raffleId);
-
-        verifier.setShouldPass(false);
-
         PrivateRaffle.Raffle memory r = raffle.getRaffle(raffleId);
+        supraRouter.fulfill(address(raffle), r.requestId, 0);
 
-        bytes32[] memory publicInputs = new bytes32[](6);
-        publicInputs[0] = bytes32(r.root);
-        publicInputs[1] = bytes32(uint256(111));
-        uint256 recipientBinding = poseidon2.hash_2(
-            uint256(111),
-            uint256(uint160(winner))
+        r = raffle.getRaffle(raffleId);
+
+        bytes32[] memory leaves = new bytes32[](1);
+        leaves[0] = _commitment;
+
+        (bytes memory proof, bytes32[] memory publicInputs) = _getProof(
+            _nullifier,
+            _secret,
+            participant1,
+            raffleId,
+            r.winnerIndex,
+            LEVELS,
+            leaves
         );
-        publicInputs[2] = bytes32(recipientBinding);
-        publicInputs[3] = bytes32(uint256(raffleId));
-        publicInputs[4] = bytes32(r.winnerIndex);
-        publicInputs[5] = bytes32(uint256(LEVELS));
 
         vm.prank(relayer);
-        vm.expectRevert(PrivateRaffle.InvalidProof.selector);
+        vm.expectRevert();
         raffle.claimPrize(raffleId, "bad_proof", publicInputs, winner, 0);
     }
 
@@ -338,13 +454,5 @@ contract PrivateRaffleTest is Test {
 
         vm.warp(block.timestamp + DURATION + 1);
         assertFalse(raffle.isRaffleActive(raffleId));
-    }
-
-    function test_ComputeHash() public view {
-        uint256 a = 12345;
-        uint256 b = 67890;
-        uint256 expected = poseidon2.hash_2(a, b);
-        uint256 result = raffle.computeHash(a, b);
-        assertEq(result, expected);
     }
 }
